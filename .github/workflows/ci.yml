@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint-and-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Instalar ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+
+      - name: Instalar dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt ruff
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Smoke test (CPU, modelo tiny)
+        env:
+          WHISPER_DEVICE: cpu
+          WHISPER_MODEL: tiny
+          WHISPER_COMPUTE: int8
+        run: |
+          python -m uvicorn server:app --host 127.0.0.1 --port 18005 &
+          SERVER_PID=$!
+          trap 'kill $SERVER_PID 2>/dev/null || true' EXIT
+
+          # esperar a que el modelo cargue y /health responda
+          for i in $(seq 1 60); do
+            if curl -sf http://127.0.0.1:18005/health >/dev/null; then break; fi
+            sleep 2
+          done
+          curl -sf http://127.0.0.1:18005/health
+
+          # transcripción real de extremo a extremo
+          curl -sfL -o jfk.wav https://raw.githubusercontent.com/ggerganov/whisper.cpp/master/samples/jfk.wav
+          RESP=$(curl -sf http://127.0.0.1:18005/v1/audio/transcriptions \
+                   -F "file=@jfk.wav" -F "model=whisper-tiny")
+          echo "Respuesta: $RESP"
+          echo "$RESP" | python -c "import sys,json; t=json.load(sys.stdin)['text']; assert t.strip(), 'transcripción vacía'; print('OK ->', t)"
+
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build de la imagen Docker
+        run: docker build -t whisper-asr:ci .

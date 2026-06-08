@@ -1,5 +1,7 @@
 # whisper-asr
 
+[![CI](https://github.com/Naroh091/whisper-asr/actions/workflows/ci.yml/badge.svg)](https://github.com/Naroh091/whisper-asr/actions/workflows/ci.yml)
+
 Backend de transcripción de voz (speech-to-text) **OpenAI-compatible**, pensado
 para colgar detrás de un gateway LiteLLM. Por debajo usa
 [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (CTranslate2, **sin
@@ -54,6 +56,22 @@ los necesita; así no dependemos del CUDA del sistema) y arranca uvicorn.
 | `WHISPER_BEAM_SIZE` | `5` | beam search |
 | `ASR_DEFAULT_LANG` | (vacío) | idioma forzado por defecto; vacío = autodetect |
 | `HF_HOME` | — | caché de modelos de Hugging Face |
+
+## Docker
+
+```bash
+docker build -t whisper-asr .
+
+# GPU (requiere NVIDIA Container Toolkit). El volumen cachea el modelo entre arranques.
+docker run --gpus all -p 18005:18005 \
+  -v whisper-cache:/root/.cache/huggingface \
+  whisper-asr
+
+# CPU (lento, para pruebas)
+docker run -p 18005:18005 -e WHISPER_DEVICE=cpu -e WHISPER_MODEL=base \
+  -v whisper-cache:/root/.cache/huggingface \
+  whisper-asr
+```
 
 ## Uso
 

@@ -10,7 +10,8 @@ faster-whisper (CTranslate2, sin torch) sobre Whisper large-v3.
     a 16 kHz mono, así no dependemos del decoder interno.
   - VAD activado por defecto para evitar las alucinaciones típicas de Whisper en
     silencios/música.
-  - Acceso a GPU serializado con un lock (la GPU la comparte con gemma/embed).
+  - Acceso a GPU serializado con un lock (pensado para compartir GPU con otros
+    servicios de inferencia).
 
 Config por entorno (ver run-asr.sh):
   WHISPER_MODEL        modelo CT2 o tamaño        (def. large-v3)
@@ -19,7 +20,6 @@ Config por entorno (ver run-asr.sh):
   WHISPER_BEAM_SIZE    beam search                (def. 5)
   ASR_DEFAULT_LANG     idioma forzado por defecto (def. vacío = autodetect)
 """
-import io
 import os
 import asyncio
 import subprocess
@@ -66,7 +66,8 @@ def _decode_to_pcm(raw: bytes) -> np.ndarray:
 
 
 def _srt_ts(t: float) -> str:
-    h, r = divmod(t, 3600); m, s = divmod(r, 60)
+    h, r = divmod(t, 3600)
+    m, s = divmod(r, 60)
     return f"{int(h):02d}:{int(m):02d}:{int(s):02d},{int((s % 1) * 1000):03d}"
 
 
