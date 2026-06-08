@@ -5,3 +5,5 @@ venv/
 asr-venv/
 *.log
 .env
+asr-api-key
+*.key

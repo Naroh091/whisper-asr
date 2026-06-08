@@ -19,6 +19,13 @@ export HF_HOME="${HF_HOME:-/workspace/.hf_home}"
 export ASR_HOST="${ASR_HOST:-127.0.0.1}"
 export ASR_PORT="${ASR_PORT:-18005}"
 
+# API key opcional: si existe el fichero (fuera del repo), se exige Bearer.
+# LiteLLM reenvía su `api_key` como Authorization: Bearer en /audio/transcriptions.
+KEY_FILE="${ASR_API_KEY_FILE:-$SCRIPT_DIR/../asr-api-key}"
+if [ -z "${ASR_API_KEY:-}" ] && [ -f "$KEY_FILE" ]; then
+    export ASR_API_KEY="$(tr -d '\r\n' < "$KEY_FILE")"
+fi
+
 exec "$VENV/bin/uvicorn" server:app \
     --app-dir "$SCRIPT_DIR" \
     --host "$ASR_HOST" --port "$ASR_PORT" \

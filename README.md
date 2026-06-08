@@ -55,7 +55,17 @@ los necesita; así no dependemos del CUDA del sistema) y arranca uvicorn.
 | `WHISPER_COMPUTE` | `float16` | `float16`, `int8_float16`, `int8`… |
 | `WHISPER_BEAM_SIZE` | `5` | beam search |
 | `ASR_DEFAULT_LANG` | (vacío) | idioma forzado por defecto; vacío = autodetect |
+| `ASR_API_KEY` | (vacío) | si se define, exige `Authorization: Bearer <key>` (vacío = sin auth) |
 | `HF_HOME` | — | caché de modelos de Hugging Face |
+
+### Autenticación
+
+El servicio escucha solo en `127.0.0.1`. Si lo expones a través de un gateway,
+define `ASR_API_KEY` y el endpoint de transcripción exigirá `Authorization:
+Bearer <key>` (`/health` queda abierto). Nota práctica con **LiteLLM**: en la
+ruta `/audio/transcriptions` el proxy **no** reenvía `extra_headers`/`headers`
+(probado en 1.85–1.88); lo único que reenvía es `api_key` como `Authorization:
+Bearer`. Por eso la autenticación va por `ASR_API_KEY` y no por cabeceras custom.
 
 ## Docker
 
@@ -98,7 +108,8 @@ model_list:
     litellm_params:
       model: openai/whisper-large-v3
       api_base: http://127.0.0.1:18005/v1
-      api_key: "EMPTY"
+      api_key: "EMPTY"          # si activas ASR_API_KEY, pon aquí ese mismo valor:
+                                # LiteLLM lo reenvía como Authorization: Bearer.
     model_info:
       mode: audio_transcription
 ```

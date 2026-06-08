@@ -19,14 +19,16 @@ Config por entorno (ver run-asr.sh):
   WHISPER_COMPUTE      float16 | int8_float16 ... (def. float16)
   WHISPER_BEAM_SIZE    beam search                (def. 5)
   ASR_DEFAULT_LANG     idioma forzado por defecto (def. vacío = autodetect)
+  ASR_API_KEY          si se define, exige Authorization: Bearer <key> (def. sin auth)
 """
 import os
+import hmac
 import asyncio
 import subprocess
 import logging
 
 import numpy as np
-from fastapi import FastAPI, File, Form, UploadFile, HTTPException
+from fastapi import FastAPI, File, Form, Header, UploadFile, HTTPException
 from fastapi.responses import JSONResponse, PlainTextResponse
 from faster_whisper import WhisperModel
 
@@ -38,10 +40,22 @@ DEVICE = os.environ.get("WHISPER_DEVICE", "cuda")
 COMPUTE = os.environ.get("WHISPER_COMPUTE", "float16")
 BEAM_SIZE = int(os.environ.get("WHISPER_BEAM_SIZE", "5"))
 DEFAULT_LANG = os.environ.get("ASR_DEFAULT_LANG", "").strip() or None
+API_KEY = os.environ.get("ASR_API_KEY", "").strip() or None
 
 app = FastAPI(title="whisper-asr", version="1.0")
 _model: WhisperModel | None = None
-_gpu_lock = asyncio.Lock()  # serializa el acceso a la GPU (compartida con gemma/embed)
+_gpu_lock = asyncio.Lock()  # serializa el acceso a la GPU (compartida con otros servicios)
+
+
+def _check_auth(authorization: str | None) -> None:
+    """Si ASR_API_KEY está definido, exige Authorization: Bearer <key>.
+    El gateway (LiteLLM) reenvía su `api_key` como ese header en la ruta de
+    transcripción —es lo único que reenvía—, así que es lo que validamos."""
+    if API_KEY is None:
+        return
+    expected = f"Bearer {API_KEY}"
+    if not authorization or not hmac.compare_digest(authorization, expected):
+        raise HTTPException(401, "API key inválida o ausente")
 
 
 @app.on_event("startup")
@@ -88,7 +102,9 @@ async def transcriptions(
     prompt: str | None = Form(default=None),
     response_format: str = Form(default="json"),
     temperature: float = Form(default=0.0),
+    authorization: str | None = Header(default=None),
 ):
+    _check_auth(authorization)
     if _model is None:
         raise HTTPException(503, "modelo aún no cargado")
 
