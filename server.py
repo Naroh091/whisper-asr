@@ -102,6 +102,8 @@ async def transcriptions(
     prompt: str | None = Form(default=None),
     response_format: str = Form(default="json"),
     temperature: float = Form(default=0.0),
+    # OpenAI manda los granularities como campos repetidos `timestamp_granularities[]`.
+    timestamp_granularities: list[str] = Form(default=[], alias="timestamp_granularities[]"),
     authorization: str | None = Header(default=None),
 ):
     _check_auth(authorization)
@@ -110,13 +112,15 @@ async def transcriptions(
 
     audio = _decode_to_pcm(await file.read())
     lang = (language or DEFAULT_LANG) or None
+    # word timestamps si el cliente lo pide explícitamente (granularity "word").
+    want_words = "word" in {g.lower() for g in timestamp_granularities}
 
     async with _gpu_lock:
         segs_gen, info = await asyncio.to_thread(
             lambda: _model.transcribe(
                 audio, language=lang, beam_size=BEAM_SIZE,
                 temperature=temperature, initial_prompt=prompt,
-                vad_filter=True,
+                vad_filter=True, word_timestamps=want_words,
             )
         )
         segments = await asyncio.to_thread(list, segs_gen)
@@ -135,7 +139,13 @@ async def transcriptions(
             f"{_vtt_ts(s.start)} --> {_vtt_ts(s.end)}\n{s.text.strip()}\n\n" for s in segments)
         return PlainTextResponse(body, media_type="text/vtt")
     if fmt == "verbose_json":
-        return JSONResponse({
+        def _words(s):
+            return [
+                {"word": w.word, "start": round(w.start, 3),
+                 "end": round(w.end, 3), "probability": round(w.probability, 4)}
+                for w in (s.words or [])
+            ]
+        payload = {
             "task": "transcribe",
             "language": info.language,
             "duration": round(info.duration, 3),
@@ -143,9 +153,14 @@ async def transcriptions(
             "segments": [
                 {"id": i, "start": round(s.start, 3), "end": round(s.end, 3),
                  "text": s.text, "avg_logprob": s.avg_logprob,
-                 "no_speech_prob": s.no_speech_prob}
+                 "no_speech_prob": s.no_speech_prob,
+                 **({"words": _words(s)} if want_words else {})}
                 for i, s in enumerate(segments)
             ],
-        })
+        }
+        if want_words:
+            # OpenAI devuelve además un array `words` aplanado a nivel raíz.
+            payload["words"] = [w for s in segments for w in _words(s)]
+        return JSONResponse(payload)
     # json (por defecto)
     return JSONResponse({"text": text})
