@@ -18,6 +18,7 @@ Config por entorno (ver run-asr.sh):
   WHISPER_DEVICE       cuda | cpu                 (def. cuda)
   WHISPER_COMPUTE      float16 | int8_float16 ... (def. float16)
   WHISPER_BEAM_SIZE    beam search                (def. 5)
+  WHISPER_CPU_THREADS  hilos CTranslate2 en CPU   (def. 0 = auto)
   ASR_DEFAULT_LANG     idioma forzado por defecto (def. vacío = autodetect)
   ASR_API_KEY          si se define, exige Authorization: Bearer <key> (def. sin auth)
 
@@ -54,6 +55,7 @@ MODEL_NAME = os.environ.get("WHISPER_MODEL", "large-v3")
 DEVICE = os.environ.get("WHISPER_DEVICE", "cuda")
 COMPUTE = os.environ.get("WHISPER_COMPUTE", "float16")
 BEAM_SIZE = int(os.environ.get("WHISPER_BEAM_SIZE", "5"))
+CPU_THREADS = int(os.environ.get("WHISPER_CPU_THREADS", "0"))  # 0 = default de CTranslate2
 DEFAULT_LANG = os.environ.get("ASR_DEFAULT_LANG", "").strip() or None
 API_KEY = os.environ.get("ASR_API_KEY", "").strip() or None
 
@@ -84,7 +86,7 @@ def _check_auth(authorization: str | None) -> None:
 def _load():
     global _model, _diar_pipe
     log.info("cargando %s en %s (%s)...", MODEL_NAME, DEVICE, COMPUTE)
-    _model = WhisperModel(MODEL_NAME, device=DEVICE, compute_type=COMPUTE)
+    _model = WhisperModel(MODEL_NAME, device=DEVICE, compute_type=COMPUTE, cpu_threads=CPU_THREADS)
     log.info("modelo ASR listo")
     if not ENABLE_DIAR:
         return

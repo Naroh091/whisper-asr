@@ -11,10 +11,16 @@ VENV="${ASR_VENV:-$SCRIPT_DIR/../asr-venv}"
 NV="$VENV/lib/python3.12/site-packages/nvidia"
 export LD_LIBRARY_PATH="$(find "$NV" -name lib -type d 2>/dev/null | tr '\n' ':')$LD_LIBRARY_PATH"
 
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+# Whisper + diarización corren en CPU para dejar toda la VRAM a Gemma (contexto 256K).
+# Esta CPU (Threadripper, AVX-512) transcribe large-v3 int8 a ~6-8x realtime: sobra
+# para batch y para el streaming (ventanas <=20s). cpu_threads acotado para no ahogar
+# a diart. Volver a GPU: WHISPER_DEVICE=cuda WHISPER_COMPUTE=float16 CUDA_VISIBLE_DEVICES=0.
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES-}"   # vacío = sin GPU (0 VRAM)
 export WHISPER_MODEL="${WHISPER_MODEL:-large-v3}"
-export WHISPER_DEVICE="${WHISPER_DEVICE:-cuda}"
-export WHISPER_COMPUTE="${WHISPER_COMPUTE:-float16}"
+export WHISPER_DEVICE="${WHISPER_DEVICE:-cpu}"
+export WHISPER_COMPUTE="${WHISPER_COMPUTE:-int8}"
+export WHISPER_BEAM_SIZE="${WHISPER_BEAM_SIZE:-1}"
+export WHISPER_CPU_THREADS="${WHISPER_CPU_THREADS:-16}"
 export HF_HOME="${HF_HOME:-/workspace/.hf_home}"
 export ASR_HOST="${ASR_HOST:-127.0.0.1}"
 export ASR_PORT="${ASR_PORT:-18005}"
