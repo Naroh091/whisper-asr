@@ -1,0 +1,26 @@
+# Dependencias del servicio de streaming (diart). Va en su PROPIO venv (diart-venv),
+# separado del backend batch, porque diart 0.9.x NO es compatible con pyannote 4.x.
+#
+# ORDEN DE INSTALACIÓN (el torch CPU debe venir del índice de PyTorch, no de PyPI):
+#   python3 -m venv diart-venv
+#   diart-venv/bin/pip install torch==2.2.2 torchaudio==2.2.2 torchvision==0.17.2 \
+#       --index-url https://download.pytorch.org/whl/cpu
+#   diart-venv/bin/pip install -r requirements.txt
+#   # sistema: apt install -y libportaudio2 ffmpeg
+#
+# Por qué cada pin (todos comprobados):
+#   pyannote.audio 3.1  -> diart usa la API vieja use_auth_token, que huggingface_hub>=0.26
+#                          eliminó; pyannote 4.x exige hub nuevo -> incompatibles.
+#   huggingface_hub<0.26 -> conserva use_auth_token.
+#   torchaudio 2.2      -> >=2.9 quitó torchaudio.AudioMetaData (lo usa pyannote.core).
+#   matplotlib<3.9      -> >=3.9 quitó matplotlib.cm.get_cmap (lo importa pyannote.core).
+#   numpy<2             -> lo exige diart.
+pyannote.audio==3.1.1
+huggingface_hub<0.26
+matplotlib<3.9
+numpy<2
+diart
+yt-dlp
+fastapi
+uvicorn
+httpx

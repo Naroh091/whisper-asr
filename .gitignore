@@ -7,3 +7,5 @@ asr-venv/
 .env
 asr-api-key
 *.key
+diart-venv/
+hf-token

@@ -26,6 +26,14 @@ if [ -z "${ASR_API_KEY:-}" ] && [ -f "$KEY_FILE" ]; then
     export ASR_API_KEY="$(tr -d '\r\n' < "$KEY_FILE")"
 fi
 
+# Token HF para diarization (pyannote, modelos gated). Si existe el fichero
+# (fuera del repo, chmod 600), se carga y se habilita la diarización.
+HF_TOKEN_FILE="${HF_TOKEN_FILE:-$SCRIPT_DIR/../hf-token}"
+if [ -z "${HF_TOKEN:-}" ] && [ -f "$HF_TOKEN_FILE" ]; then
+    export HF_TOKEN="$(tr -d '\r\n' < "$HF_TOKEN_FILE")"
+fi
+export ASR_ENABLE_DIARIZATION="${ASR_ENABLE_DIARIZATION:-1}"
+
 exec "$VENV/bin/uvicorn" server:app \
     --app-dir "$SCRIPT_DIR" \
     --host "$ASR_HOST" --port "$ASR_PORT" \
