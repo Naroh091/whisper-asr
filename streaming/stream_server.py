@@ -284,13 +284,26 @@ async def _flush_worker(state: StreamState, q: asyncio.Queue, language: str | No
                     i1 = max(i0, int((end - b) * SAMPLE_RATE) * 4)
                     sl = bytes(state.audio[i0:i1])
                     diar = state.diar.copy()
+                next_emitted = end
                 try:
                     words = await _transcribe_words(client, sl, language)
+                    # Frontera de ventana: la palabra que cae en el corte `end` se
+                    # trocea (queda cortada al final de esta ventana y al principio
+                    # de la siguiente) y Whisper la pierde. Salvo en el tramo final,
+                    # descartamos la última palabra y reencolamos `emitted` a su
+                    # inicio, para que la próxima ventana la capture entera (el
+                    # solape = su duración). Cada palabra se emite una sola vez.
+                    is_tail = closed and end >= committed - 1e-6
+                    if not is_tail and len(words) >= 2:
+                        cut = emitted + float(words[-1]["start"])
+                        if cut > emitted + 0.5:      # asegura progreso mínimo
+                            words = words[:-1]
+                            next_emitted = cut
                     for seg in _fuse(words, diar, emitted, mapping):
                         await q.put(_sse({"type": "transcript.text.segment", **seg}))
                 except Exception as e:  # noqa: BLE001
                     await q.put(_sse({"type": "error", "message": str(e)[:300]}))
-                emitted = end
+                emitted = next_emitted
             # ventana rodante: descarta audio y turnos anteriores a RETENTION_S.
             with state.lock:
                 new_base = max(state.base, state.latest_time - RETENTION_S)
