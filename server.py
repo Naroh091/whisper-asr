@@ -150,6 +150,26 @@ def _decode_to_pcm(raw: bytes) -> np.ndarray:
     return np.frombuffer(proc.stdout, dtype=np.float32).copy()
 
 
+def _decode_url_to_pcm(url: str) -> np.ndarray:
+    """Descarga y decodifica una URL (http/https; p.ej. S3 presigned) a float32
+    mono 16 kHz. ffmpeg lee la URL directamente en streaming: no carga el fichero
+    entero en RAM. Solo http(s) para acotar el SSRF; `-reconnect*` da robustez
+    ante cortes de red típicos de descargas largas."""
+    from urllib.parse import urlparse
+    if urlparse(url).scheme not in ("http", "https"):
+        raise HTTPException(400, "file_url debe empezar por http:// o https://")
+    proc = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error",
+         "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
+         "-i", url, "-f", "f32le", "-ac", "1", "-ar", "16000", "pipe:1"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    if proc.returncode != 0:
+        raise HTTPException(400, f"no se pudo descargar/decodificar la URL: "
+                                 f"{proc.stderr.decode('utf-8', 'ignore')[:300]}")
+    return np.frombuffer(proc.stdout, dtype=np.float32).copy()
+
+
 def _srt_ts(t: float) -> str:
     h, r = divmod(t, 3600)
     m, s = divmod(r, 60)
@@ -168,7 +188,11 @@ def health():
 
 @app.post("/v1/audio/transcriptions")
 async def transcriptions(
-    file: UploadFile = File(...),
+    file: UploadFile | None = File(default=None),
+    # Extensión propia (no OpenAI): en vez de subir el binario, pasar una URL
+    # (http/https, S3 presigned…) y el servidor la lee. Evita el límite de tamaño
+    # de subida del gateway; ffmpeg la descarga en streaming, sin cargarla en RAM.
+    file_url: str | None = Form(default=None),
     model: str = Form(default=MODEL_NAME),          # se acepta y se ignora (compat OpenAI)
     language: str | None = Form(default=None),
     prompt: str | None = Form(default=None),
@@ -196,7 +220,13 @@ async def transcriptions(
         raise HTTPException(400, "diarization no disponible en este servidor "
                                  "(requiere ASR_ENABLE_DIARIZATION=1 + pyannote + HF_TOKEN)")
 
-    audio = _decode_to_pcm(await file.read())
+    if file is not None:
+        audio = _decode_to_pcm(await file.read())
+    elif file_url:
+        # descarga+decodifica en un hilo para no bloquear el event loop
+        audio = await asyncio.to_thread(_decode_url_to_pcm, file_url)
+    else:
+        raise HTTPException(400, "falta 'file' (multipart) o 'file_url'")
     lang = (language or DEFAULT_LANG) or None
     # word timestamps si el cliente lo pide, o siempre que haya diarización
     # (los necesitamos para asignar hablante palabra a palabra).
