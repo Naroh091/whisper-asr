@@ -28,6 +28,7 @@ Diarization (opcional, requiere torch + pyannote.audio + modelos gated):
   HF_TOKEN                token HF con acceso a los modelos gated de pyannote
 """
 import os
+import json
 import hmac
 import asyncio
 import subprocess
@@ -35,8 +36,8 @@ import logging
 from collections import Counter
 
 import numpy as np
-from fastapi import FastAPI, File, Form, Header, UploadFile, HTTPException
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi import FastAPI, File, Form, Header, UploadFile, HTTPException, Response
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from faster_whisper import WhisperModel
 
 # torch + pyannote son opcionales: el ASR funciona sin ellos (diarization off).
@@ -58,6 +59,9 @@ BEAM_SIZE = int(os.environ.get("WHISPER_BEAM_SIZE", "5"))
 CPU_THREADS = int(os.environ.get("WHISPER_CPU_THREADS", "0"))  # 0 = default de CTranslate2
 DEFAULT_LANG = os.environ.get("ASR_DEFAULT_LANG", "").strip() or None
 API_KEY = os.environ.get("ASR_API_KEY", "").strip() or None
+# Latido SSE (segundos) para el modo stream=1: hay que emitir bytes antes de que
+# Cloudflare corte por 524 (~100s sin respuesta del origen). 15s deja margen de sobra.
+SSE_HEARTBEAT = float(os.environ.get("ASR_SSE_HEARTBEAT", "15"))
 
 ENABLE_DIAR = os.environ.get("ASR_ENABLE_DIARIZATION", "0").strip() in ("1", "true", "yes")
 # pyannote.audio 4.x: el pipeline "community-1" empaqueta segmentación + embedding
@@ -180,6 +184,44 @@ def _vtt_ts(t: float) -> str:
     return _srt_ts(t).replace(",", ".")
 
 
+def _sse_event(event: str, data: str) -> bytes:
+    """Serializa un evento SSE. `data` puede tener saltos de línea: se parte en
+    varias líneas `data:` como exige el protocolo (un `\\n` crudo rompería el evento)."""
+    body = "".join(f"data: {ln}\n" for ln in data.split("\n"))
+    return f"event: {event}\n{body}\n".encode("utf-8")
+
+
+async def _sse_stream(work):
+    """Envuelve el cómputo (`work`, un coroutine que devuelve un Response) en un
+    stream SSE con latidos. Emite `: ping` cada SSE_HEARTBEAT segundos mientras la
+    transcripción corre en background, para que Cloudflare no dispare el 524, y al
+    terminar un evento `done` con el cuerpo de la respuesta (o `error` si falla).
+
+    Nota: en streaming el status HTTP ya es 200 cuando empieza el trabajo, así que
+    los fallos NO pueden viajar como código HTTP; van como evento `error`."""
+    yield b": connected\n\n"  # abre la respuesta ya, antes del primer latido
+    task = asyncio.ensure_future(work)
+    try:
+        while True:
+            try:
+                # shield: el timeout cancela la espera, no el trabajo de fondo.
+                resp = await asyncio.wait_for(asyncio.shield(task), SSE_HEARTBEAT)
+                break
+            except asyncio.TimeoutError:
+                yield b": ping\n\n"
+        body = bytes(resp.body)
+        yield _sse_event("done", body.decode("utf-8", "ignore"))
+    except HTTPException as e:
+        yield _sse_event("error", json.dumps({"error": {"message": e.detail,
+                                                         "status": e.status_code}}))
+    except Exception as e:  # pragma: no cover - salvaguarda
+        log.exception("fallo en transcripción (stream)")
+        yield _sse_event("error", json.dumps({"error": {"message": str(e)}}))
+    finally:
+        if not task.done():
+            task.cancel()  # cliente desconectado: no malgastes CPU/GPU
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "model": MODEL_NAME, "device": DEVICE,
@@ -206,6 +248,9 @@ async def transcriptions(
     num_speakers: int | None = Form(default=None),
     min_speakers: int | None = Form(default=None),
     max_speakers: int | None = Form(default=None),
+    # stream=1 -> respuesta SSE con latidos (evita el 524 de Cloudflare en audios
+    # largos). Mismo cuerpo final, envuelto en un evento `done`. Ver _sse_stream.
+    stream: bool = Form(default=False),
     authorization: str | None = Header(default=None),
 ):
     _check_auth(authorization)
@@ -220,128 +265,145 @@ async def transcriptions(
         raise HTTPException(400, "diarization no disponible en este servidor "
                                  "(requiere ASR_ENABLE_DIARIZATION=1 + pyannote + HF_TOKEN)")
 
-    if file is not None:
-        audio = _decode_to_pcm(await file.read())
-    elif file_url:
-        # descarga+decodifica en un hilo para no bloquear el event loop
-        audio = await asyncio.to_thread(_decode_url_to_pcm, file_url)
-    else:
-        raise HTTPException(400, "falta 'file' (multipart) o 'file_url'")
-    lang = (language or DEFAULT_LANG) or None
-    # word timestamps si el cliente lo pide, o siempre que haya diarización
-    # (los necesitamos para asignar hablante palabra a palabra).
-    want_words = "word" in {g.lower() for g in timestamp_granularities} or do_diar
+    async def _work() -> Response:
+        """Todo el cómputo (decode + Whisper + diarización + formato). Devuelve el
+        Response final. Se ejecuta directo en modo normal, o envuelto en SSE cuando
+        stream=1 (mismo cuerpo, para no duplicar la lógica de formatos)."""
+        if file is not None:
+            audio = _decode_to_pcm(await file.read())
+        elif file_url:
+            # descarga+decodifica en un hilo para no bloquear el event loop
+            audio = await asyncio.to_thread(_decode_url_to_pcm, file_url)
+        else:
+            raise HTTPException(400, "falta 'file' (multipart) o 'file_url'")
+        lang = (language or DEFAULT_LANG) or None
+        # word timestamps si el cliente lo pide, o siempre que haya diarización
+        # (los necesitamos para asignar hablante palabra a palabra).
+        want_words = "word" in {g.lower() for g in timestamp_granularities} or do_diar
 
-    async with _gpu_lock:
-        segs_gen, info = await asyncio.to_thread(
-            lambda: _model.transcribe(
-                audio, language=lang, beam_size=BEAM_SIZE,
-                temperature=temperature, initial_prompt=prompt,
-                vad_filter=True, word_timestamps=want_words,
+        async with _gpu_lock:
+            segs_gen, info = await asyncio.to_thread(
+                lambda: _model.transcribe(
+                    audio, language=lang, beam_size=BEAM_SIZE,
+                    temperature=temperature, initial_prompt=prompt,
+                    vad_filter=True, word_timestamps=want_words,
+                )
             )
-        )
-        segments = await asyncio.to_thread(list, segs_gen)
-        # Diarización dentro del mismo lock: evita picos simultáneos de VRAM.
-        turns = None
-        if do_diar:
-            turns = await asyncio.to_thread(
-                _diarize, audio, num_speakers, min_speakers, max_speakers)
+            segments = await asyncio.to_thread(list, segs_gen)
+            # Diarización dentro del mismo lock: evita picos simultáneos de VRAM.
+            turns = None
+            if do_diar:
+                turns = await asyncio.to_thread(
+                    _diarize, audio, num_speakers, min_speakers, max_speakers)
 
-    text = "".join(s.text for s in segments).strip()
+        text = "".join(s.text for s in segments).strip()
 
-    # Etiqueta de hablante por segmento (mayoría de sus palabras) y por palabra.
-    seg_spk: list[str | None] = []
-    word_spk: list[list[str | None]] = []
-    if turns is not None:
-        for s in segments:
-            ws = s.words or []
-            wspk = [_speaker_for(turns, w.start, w.end) for w in ws]
-            word_spk.append(wspk)
-            if wspk:
-                seg_spk.append(Counter(wspk).most_common(1)[0][0])
-            else:
-                seg_spk.append(_speaker_for(turns, s.start, s.end))
-
-    # Mapeo de etiquetas pyannote (SPEAKER_00, ...) a letras "A","B",... por orden
-    # de aparición, como hace OpenAI en diarized_json.
-    alpha: dict[str, str] = {}
-    if turns is not None:
-        for sp in seg_spk:
-            if sp and sp not in alpha:
-                n = len(alpha)
-                alpha[sp] = chr(ord("A") + n) if n < 26 else f"S{n}"
-
-    def _pfx(i):  # prefijo "SPEAKER_xx: " para formatos de texto/subtítulos
-        return f"{seg_spk[i]}: " if turns is not None and seg_spk[i] else ""
-
-    if fmt == "diarized_json":
-        # Esquema de OpenAI (gpt-4o-transcribe-diarize): segmentos con speaker
-        # alfabético, texto y tiempos. Es el formato que el cliente pide por LiteLLM.
-        return JSONResponse({
-            "task": "transcribe",
-            "duration": round(info.duration, 3),
-            "text": text,
-            "segments": [
-                {"id": i, "speaker": alpha.get(seg_spk[i]),
-                 "text": s.text.strip(),
-                 "start": round(s.start, 3), "end": round(s.end, 3)}
-                for i, s in enumerate(segments)
-            ],
-        })
-
-    if fmt == "text":
-        if turns is None:
-            return PlainTextResponse(text + "\n")
-        body = "".join(f"{_pfx(i)}{s.text.strip()}\n" for i, s in enumerate(segments))
-        return PlainTextResponse(body)
-    if fmt == "srt":
-        body = "".join(f"{i}\n{_srt_ts(s.start)} --> {_srt_ts(s.end)}\n{_pfx(i-1)}{s.text.strip()}\n\n"
-                       for i, s in enumerate(segments, 1))
-        return PlainTextResponse(body, media_type="application/x-subrip")
-    if fmt == "vtt":
-        body = "WEBVTT\n\n" + "".join(
-            f"{_vtt_ts(s.start)} --> {_vtt_ts(s.end)}\n{_pfx(i)}{s.text.strip()}\n\n"
-            for i, s in enumerate(segments))
-        return PlainTextResponse(body, media_type="text/vtt")
-    if fmt == "verbose_json":
-        def _words(i, s):
-            spk = word_spk[i] if turns is not None else None
-            out = []
-            for j, w in enumerate(s.words or []):
-                d = {"word": w.word, "start": round(w.start, 3),
-                     "end": round(w.end, 3), "probability": round(w.probability, 4)}
-                if spk is not None:
-                    d["speaker"] = spk[j]
-                out.append(d)
-            return out
-        payload = {
-            "task": "transcribe",
-            "language": info.language,
-            "duration": round(info.duration, 3),
-            "text": text,
-            "segments": [
-                {"id": i, "start": round(s.start, 3), "end": round(s.end, 3),
-                 "text": s.text, "avg_logprob": s.avg_logprob,
-                 "no_speech_prob": s.no_speech_prob,
-                 **({"speaker": seg_spk[i]} if turns is not None else {}),
-                 **({"words": _words(i, s)} if want_words else {})}
-                for i, s in enumerate(segments)
-            ],
-        }
-        if want_words:
-            payload["words"] = [w for i, s in enumerate(segments) for w in _words(i, s)]
+        # Etiqueta de hablante por segmento (mayoría de sus palabras) y por palabra.
+        seg_spk: list[str | None] = []
+        word_spk: list[list[str | None]] = []
         if turns is not None:
-            payload["speakers"] = sorted({lbl for _, _, lbl in turns})
-        return JSONResponse(payload)
-    # json (por defecto). Con diarización devolvemos también segmentos+hablante.
-    if turns is not None:
-        return JSONResponse({
-            "text": text,
-            "speakers": sorted({lbl for _, _, lbl in turns}),
-            "segments": [
-                {"start": round(s.start, 3), "end": round(s.end, 3),
-                 "speaker": seg_spk[i], "text": s.text}
-                for i, s in enumerate(segments)
-            ],
-        })
-    return JSONResponse({"text": text})
+            for s in segments:
+                ws = s.words or []
+                wspk = [_speaker_for(turns, w.start, w.end) for w in ws]
+                word_spk.append(wspk)
+                if wspk:
+                    seg_spk.append(Counter(wspk).most_common(1)[0][0])
+                else:
+                    seg_spk.append(_speaker_for(turns, s.start, s.end))
+
+        # Mapeo de etiquetas pyannote (SPEAKER_00, ...) a letras "A","B",... por orden
+        # de aparición, como hace OpenAI en diarized_json.
+        alpha: dict[str, str] = {}
+        if turns is not None:
+            for sp in seg_spk:
+                if sp and sp not in alpha:
+                    n = len(alpha)
+                    alpha[sp] = chr(ord("A") + n) if n < 26 else f"S{n}"
+
+        def _pfx(i):  # prefijo "SPEAKER_xx: " para formatos de texto/subtítulos
+            return f"{seg_spk[i]}: " if turns is not None and seg_spk[i] else ""
+
+        if fmt == "diarized_json":
+            # Esquema de OpenAI (gpt-4o-transcribe-diarize): segmentos con speaker
+            # alfabético, texto y tiempos. Es el formato que el cliente pide por LiteLLM.
+            return JSONResponse({
+                "task": "transcribe",
+                "duration": round(info.duration, 3),
+                "text": text,
+                "segments": [
+                    {"id": i, "speaker": alpha.get(seg_spk[i]),
+                     "text": s.text.strip(),
+                     "start": round(s.start, 3), "end": round(s.end, 3)}
+                    for i, s in enumerate(segments)
+                ],
+            })
+
+        if fmt == "text":
+            if turns is None:
+                return PlainTextResponse(text + "\n")
+            body = "".join(f"{_pfx(i)}{s.text.strip()}\n" for i, s in enumerate(segments))
+            return PlainTextResponse(body)
+        if fmt == "srt":
+            body = "".join(f"{i}\n{_srt_ts(s.start)} --> {_srt_ts(s.end)}\n{_pfx(i-1)}{s.text.strip()}\n\n"
+                           for i, s in enumerate(segments, 1))
+            return PlainTextResponse(body, media_type="application/x-subrip")
+        if fmt == "vtt":
+            body = "WEBVTT\n\n" + "".join(
+                f"{_vtt_ts(s.start)} --> {_vtt_ts(s.end)}\n{_pfx(i)}{s.text.strip()}\n\n"
+                for i, s in enumerate(segments))
+            return PlainTextResponse(body, media_type="text/vtt")
+        if fmt == "verbose_json":
+            def _words(i, s):
+                spk = word_spk[i] if turns is not None else None
+                out = []
+                for j, w in enumerate(s.words or []):
+                    d = {"word": w.word, "start": round(w.start, 3),
+                         "end": round(w.end, 3), "probability": round(w.probability, 4)}
+                    if spk is not None:
+                        d["speaker"] = spk[j]
+                    out.append(d)
+                return out
+            payload = {
+                "task": "transcribe",
+                "language": info.language,
+                "duration": round(info.duration, 3),
+                "text": text,
+                "segments": [
+                    {"id": i, "start": round(s.start, 3), "end": round(s.end, 3),
+                     "text": s.text, "avg_logprob": s.avg_logprob,
+                     "no_speech_prob": s.no_speech_prob,
+                     **({"speaker": seg_spk[i]} if turns is not None else {}),
+                     **({"words": _words(i, s)} if want_words else {})}
+                    for i, s in enumerate(segments)
+                ],
+            }
+            if want_words:
+                payload["words"] = [w for i, s in enumerate(segments) for w in _words(i, s)]
+            if turns is not None:
+                payload["speakers"] = sorted({lbl for _, _, lbl in turns})
+            return JSONResponse(payload)
+        # json (por defecto). Con diarización devolvemos también segmentos+hablante.
+        if turns is not None:
+            return JSONResponse({
+                "text": text,
+                "speakers": sorted({lbl for _, _, lbl in turns}),
+                "segments": [
+                    {"start": round(s.start, 3), "end": round(s.end, 3),
+                     "speaker": seg_spk[i], "text": s.text}
+                    for i, s in enumerate(segments)
+                ],
+            })
+        return JSONResponse({"text": text})
+
+    if not stream:
+        return await _work()
+
+    # SSE: latidos hasta que _work() termine, luego el cuerpo en un evento `done`.
+    # X-Accel-Buffering desactiva el buffering de nginx; los proxies aguas arriba
+    # (LiteLLM pass-through) también deben reenviar el stream sin bufferizar.
+    return StreamingResponse(
+        _sse_stream(_work()),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive",
+                 "X-Accel-Buffering": "no"},
+    )
