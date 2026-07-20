@@ -121,8 +121,31 @@ trabajo, así que un fallo de decodificación/transcripción **llega como evento
 `error`, no como código HTTP**.
 
 **Importante:** todo proxy intermedio debe reenviar el stream sin bufferizar. La
-respuesta ya manda `X-Accel-Buffering: no` (nginx); en el pass-through de LiteLLM
-verifica que no acumule el cuerpo antes de reenviarlo.
+respuesta ya manda `X-Accel-Buffering: no` (nginx).
+
+### Ruta JSON `/v1/file/transcriptions` (obligatoria tras el pass-through de LiteLLM)
+
+El pass-through de LiteLLM solo abre el upstream en modo streaming si detecta
+`stream` en un cuerpo **JSON**; con `multipart/form-data` no parsea el cuerpo,
+así que `-F "stream=1"` le resulta invisible y **bufferiza la respuesta SSE
+entera** (el cliente no ve ni `: connected` hasta que acaba la transcripción, y
+Cloudflare corta con 524). Verificado en el código de LiteLLM hasta v1.94: la
+rama multipart siempre lee la respuesta completa.
+
+Por eso existe `POST /v1/file/transcriptions`: mismos campos que la ruta form
+pero en JSON, solo con `file_url` (sin subida de fichero). Con `"stream": true`
+LiteLLM sí toma su rama streaming y reenvía el SSE chunk a chunk:
+
+```bash
+curl -N https://llm.botalite.es/v1/file/transcriptions \
+  -H "Authorization: Bearer sk-…" -H "Content-Type: application/json" \
+  -d '{"file_url":"https://…/audio.mp3","stream":true,
+       "response_format":"diarized_json","diarization":true}'
+```
+
+En LiteLLM se configura como Pass Through Endpoint: `/v1/file/transcriptions` →
+`http(s)://<asr>/v1/file/transcriptions`. Los campos desconocidos que LiteLLM
+inyecta en el JSON se ignoran.
 
 ## Despliegue (supervisord)
 
