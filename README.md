@@ -99,10 +99,12 @@ Salud: `GET /health`.
 
 Audios largos pueden tardar más de los ~100 s que Cloudflare tolera sin respuesta
 del origen (error `524`). Con `stream=1` la ruta responde en `text/event-stream`:
-emite cabeceras al instante y un latido (`: ping`) cada `ASR_SSE_HEARTBEAT` s
-(def. 15) mientras Whisper trabaja, y al terminar un evento `done` con el **mismo
-cuerpo** que devolvería la respuesta normal. Como Cloudflare recibe bytes desde el
-principio, no dispara el 524 aunque la transcripción dure minutos.
+emite cabeceras al instante, un evento `segment` por cada segmento según Whisper
+lo produce (transcripción visible en vivo), un latido (`: ping`) cada
+`ASR_SSE_HEARTBEAT` s (def. 15) en las fases sin segmentos (descarga,
+diarización), y al terminar un evento `done` con el **mismo cuerpo** que
+devolvería la respuesta normal. Como Cloudflare recibe bytes desde el principio,
+no dispara el 524 aunque la transcripción dure minutos.
 
 ```bash
 curl -N http://127.0.0.1:18005/v1/audio/transcriptions \
@@ -110,15 +112,29 @@ curl -N http://127.0.0.1:18005/v1/audio/transcriptions \
   -F "response_format=diarized_json" -F "diarization=true" \
   -F "stream=1"
 # : connected
-# : ping           (cada 15s)
+# : ping           (descarga/decodificación, luego diarización)
+# event: segment
+# data: {"start":0.0,"end":4.2,"text":"Hola, bienvenidos…","speaker":"A"}
+# event: segment
+# data: {"start":4.2,"end":9.8,"text":"…","speaker":"B"}
 # event: done
 # data: {"task":"transcribe",...}
 ```
 
-Eventos: `done` (data = cuerpo final, JSON en una línea) o `error` (data =
-`{"error":{...}}`). Ojo: en streaming el status HTTP ya es `200` cuando empieza el
-trabajo, así que un fallo de decodificación/transcripción **llega como evento
+Eventos: `segment` (parcial: `start`, `end`, `text` y, con diarización activa,
+`speaker`), `done` (data = cuerpo final, JSON en una línea; el cliente debe
+quedarse con este y descartar los parciales) o `error` (data =
+`{"error":{...}}`). Ojo: en streaming el status HTTP ya es `200` cuando empieza
+el trabajo, así que un fallo de decodificación/transcripción **llega como evento
 `error`, no como código HTTP**.
+
+Con diarización, pyannote corre **antes** que Whisper (sobre el audio completo:
+etiquetas globalmente consistentes, sin renormalizar entre bloques), así que los
+primeros `segment` tardan lo que dure esa fase (latidos mientras) pero ya llevan
+su hablante: alfabético (`"A"`, `"B"`, …) con `response_format=diarized_json` —
+idéntico al mapeo del `done` — o la etiqueta pyannote (`SPEAKER_00`, …) en el
+resto de formatos, igual que en el cuerpo final. Sin diarización no hay campo
+`speaker` y los `segment` empiezan en cuanto acaba la descarga.
 
 **Importante:** todo proxy intermedio debe reenviar el stream sin bufferizar. La
 respuesta ya manda `X-Accel-Buffering: no` (nginx).

@@ -191,25 +191,41 @@ def _sse_event(event: str, data: str) -> bytes:
     return f"event: {event}\n{body}\n".encode("utf-8")
 
 
-async def _sse_stream(work):
+async def _sse_stream(work, progress: asyncio.Queue | None = None):
     """Envuelve el cómputo (`work`, un coroutine que devuelve un Response) en un
     stream SSE con latidos. Emite `: ping` cada SSE_HEARTBEAT segundos mientras la
-    transcripción corre en background, para que Cloudflare no dispare el 524, y al
-    terminar un evento `done` con el cuerpo de la respuesta (o `error` si falla).
+    transcripción corre en background, para que Cloudflare no dispare el 524; si
+    `work` empuja segmentos parciales a `progress`, cada uno sale como evento
+    `segment` en cuanto Whisper lo produce; al terminar, un evento `done` con el
+    cuerpo completo de la respuesta (o `error` si falla).
 
     Nota: en streaming el status HTTP ya es 200 cuando empieza el trabajo, así que
     los fallos NO pueden viajar como código HTTP; van como evento `error`."""
     log.info("sse: abriendo stream (primer byte)")
     yield b": connected\n\n"  # abre la respuesta ya, antes del primer latido
     task = asyncio.ensure_future(work)
+    getter: asyncio.Task | None = None  # get() pendiente sobre la cola de progreso
     try:
         while True:
-            try:
-                # shield: el timeout cancela la espera, no el trabajo de fondo.
-                resp = await asyncio.wait_for(asyncio.shield(task), SSE_HEARTBEAT)
+            if progress is not None and getter is None:
+                getter = asyncio.ensure_future(progress.get())
+            waiters = {task, getter} if getter is not None else {task}
+            done, _ = await asyncio.wait(waiters, timeout=SSE_HEARTBEAT,
+                                         return_when=asyncio.FIRST_COMPLETED)
+            if getter is not None and getter in done:
+                seg = getter.result()
+                getter = None
+                yield _sse_event("segment", json.dumps(seg, ensure_ascii=False))
+                continue  # sigue drenando la cola antes de mirar el task
+            if task in done:
                 break
-            except asyncio.TimeoutError:
-                yield b": ping\n\n"
+            yield b": ping\n\n"
+        # segmentos que quedaran encolados cuando terminó el trabajo
+        if progress is not None:
+            while not progress.empty():
+                yield _sse_event("segment",
+                                 json.dumps(progress.get_nowait(), ensure_ascii=False))
+        resp = task.result()  # relanza la excepción de _work si la hubo
         body = bytes(resp.body)
         log.info("sse: emitiendo done (%d bytes)", len(body))
         yield _sse_event("done", body.decode("utf-8", "ignore"))
@@ -220,6 +236,8 @@ async def _sse_stream(work):
         log.exception("fallo en transcripción (stream)")
         yield _sse_event("error", json.dumps({"error": {"message": str(e)}}))
     finally:
+        if getter is not None and not getter.done():
+            getter.cancel()
         if not task.done():
             task.cancel()  # cliente desconectado: no malgastes CPU/GPU
 
@@ -267,10 +285,11 @@ async def transcriptions(
         raise HTTPException(400, "diarization no disponible en este servidor "
                                  "(requiere ASR_ENABLE_DIARIZATION=1 + pyannote + HF_TOKEN)")
 
-    async def _work() -> Response:
+    async def _work(progress: asyncio.Queue | None = None) -> Response:
         """Todo el cómputo (decode + Whisper + diarización + formato). Devuelve el
         Response final. Se ejecuta directo en modo normal, o envuelto en SSE cuando
-        stream=1 (mismo cuerpo, para no duplicar la lógica de formatos)."""
+        stream=1 (mismo cuerpo, para no duplicar la lógica de formatos). Si recibe
+        `progress`, empuja cada segmento transcrito según Whisper lo produce."""
         if file is not None:
             audio = _decode_to_pcm(await file.read())
         elif file_url:
@@ -284,6 +303,14 @@ async def transcriptions(
         want_words = "word" in {g.lower() for g in timestamp_granularities} or do_diar
 
         async with _gpu_lock:
+            # Diarización ANTES de transcribir (mismo lock: evita picos simultáneos
+            # de VRAM). Al ir primero, en streaming cada evento `segment` sale ya
+            # con su hablante; pyannote ve el audio completo, así que las etiquetas
+            # son globalmente consistentes desde el primer segmento.
+            turns = None
+            if do_diar:
+                turns = await asyncio.to_thread(
+                    _diarize, audio, num_speakers, min_speakers, max_speakers)
             segs_gen, info = await asyncio.to_thread(
                 lambda: _model.transcribe(
                     audio, language=lang, beam_size=BEAM_SIZE,
@@ -291,12 +318,43 @@ async def transcriptions(
                     vad_filter=True, word_timestamps=want_words,
                 )
             )
-            segments = await asyncio.to_thread(list, segs_gen)
-            # Diarización dentro del mismo lock: evita picos simultáneos de VRAM.
-            turns = None
-            if do_diar:
-                turns = await asyncio.to_thread(
-                    _diarize, audio, num_speakers, min_speakers, max_speakers)
+            if progress is None:
+                segments = await asyncio.to_thread(list, segs_gen)
+            else:
+                # El generador de faster-whisper es perezoso: cada segmento sale
+                # según avanza la decodificación. Se empuja a la cola SSE desde el
+                # hilo (call_soon_threadsafe) para que el cliente lo vea en vivo.
+                loop = asyncio.get_running_loop()
+                alpha_live: dict[str, str] = {}
+
+                def _live_item(s) -> dict:
+                    item = {"start": round(s.start, 3), "end": round(s.end, 3),
+                            "text": s.text.strip()}
+                    if turns is not None:
+                        # mismo criterio que el cuerpo final: mayoría de las
+                        # palabras del segmento (o solape del segmento entero)
+                        wspk = [_speaker_for(turns, w.start, w.end)
+                                for w in (s.words or [])]
+                        spk = (Counter(wspk).most_common(1)[0][0] if wspk
+                               else _speaker_for(turns, s.start, s.end))
+                        if fmt == "diarized_json":
+                            # misma normalización alfabética y mismo orden de
+                            # aparición que producirá el `done`
+                            if spk is not None and spk not in alpha_live:
+                                n = len(alpha_live)
+                                alpha_live[spk] = chr(ord("A") + n) if n < 26 else f"S{n}"
+                            spk = alpha_live.get(spk)
+                        item["speaker"] = spk
+                    return item
+
+                def _consume() -> list:
+                    out = []
+                    for s in segs_gen:
+                        out.append(s)
+                        loop.call_soon_threadsafe(progress.put_nowait, _live_item(s))
+                    return out
+
+                segments = await asyncio.to_thread(_consume)
 
         text = "".join(s.text for s in segments).strip()
 
@@ -400,11 +458,13 @@ async def transcriptions(
     if not stream:
         return await _work()
 
-    # SSE: latidos hasta que _work() termine, luego el cuerpo en un evento `done`.
+    # SSE: eventos `segment` según Whisper produce cada segmento, latidos cuando
+    # no hay actividad (descarga, diarización), y el cuerpo final en `done`.
     # X-Accel-Buffering desactiva el buffering de nginx; los proxies aguas arriba
     # (LiteLLM pass-through) también deben reenviar el stream sin bufferizar.
+    progress: asyncio.Queue = asyncio.Queue()
     return StreamingResponse(
-        _sse_stream(_work()),
+        _sse_stream(_work(progress), progress),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive",
                  "X-Accel-Buffering": "no"},
