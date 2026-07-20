@@ -36,7 +36,7 @@ import logging
 from collections import Counter
 
 import numpy as np
-from fastapi import FastAPI, File, Form, Header, UploadFile, HTTPException, Response
+from fastapi import FastAPI, File, Form, Header, Request, UploadFile, HTTPException, Response
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from faster_whisper import WhisperModel
 
@@ -199,6 +199,7 @@ async def _sse_stream(work):
 
     Nota: en streaming el status HTTP ya es 200 cuando empieza el trabajo, así que
     los fallos NO pueden viajar como código HTTP; van como evento `error`."""
+    log.info("sse: abriendo stream (primer byte)")
     yield b": connected\n\n"  # abre la respuesta ya, antes del primer latido
     task = asyncio.ensure_future(work)
     try:
@@ -210,6 +211,7 @@ async def _sse_stream(work):
             except asyncio.TimeoutError:
                 yield b": ping\n\n"
         body = bytes(resp.body)
+        log.info("sse: emitiendo done (%d bytes)", len(body))
         yield _sse_event("done", body.decode("utf-8", "ignore"))
     except HTTPException as e:
         yield _sse_event("error", json.dumps({"error": {"message": e.detail,
@@ -406,4 +408,57 @@ async def transcriptions(
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive",
                  "X-Accel-Buffering": "no"},
+    )
+
+
+def _json_bool(v, field: str) -> bool:
+    """Bool de un cuerpo JSON, tolerando 1/0 y "1"/"true" (comodidad de curl)."""
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)) and v in (0, 1):
+        return bool(v)
+    if isinstance(v, str) and v.strip().lower() in ("1", "true", "yes", "0", "false", "no", ""):
+        return v.strip().lower() in ("1", "true", "yes")
+    raise HTTPException(400, f"'{field}' debe ser booleano")
+
+
+@app.post("/v1/file/transcriptions")
+async def file_transcriptions(request: Request,
+                              authorization: str | None = Header(default=None)):
+    """Variante JSON de /v1/audio/transcriptions, solo con `file_url` (sin subida).
+
+    Existe por el pass-through de LiteLLM: solo detecta `stream` en cuerpos JSON
+    (`_update_stream_param_based_on_request_body`); con multipart no parsea el
+    cuerpo, cae en la rama no-streaming y bufferiza la respuesta SSE entera, lo
+    que anula los latidos anti-524. Mismos campos que la ruta form. Los campos
+    desconocidos se ignoran: LiteLLM inyecta claves propias (litellm_logging_obj,
+    etc.) en el JSON que reenvía.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "cuerpo JSON inválido")
+    if not isinstance(body, dict):
+        raise HTTPException(400, "el cuerpo debe ser un objeto JSON")
+    file_url = body.get("file_url")
+    if not isinstance(file_url, str) or not file_url.strip():
+        raise HTTPException(400, "falta 'file_url' (esta ruta no acepta subida de fichero)")
+    tg = body.get("timestamp_granularities", body.get("timestamp_granularities[]") or [])
+    if isinstance(tg, str):
+        tg = [tg]
+    return await transcriptions(
+        file=None,
+        file_url=file_url,
+        model=str(body.get("model") or MODEL_NAME),
+        language=body.get("language"),
+        prompt=body.get("prompt"),
+        response_format=str(body.get("response_format") or "json"),
+        temperature=float(body.get("temperature") or 0.0),
+        timestamp_granularities=[str(g) for g in tg],
+        diarization=_json_bool(body.get("diarization", False), "diarization"),
+        num_speakers=body.get("num_speakers"),
+        min_speakers=body.get("min_speakers"),
+        max_speakers=body.get("max_speakers"),
+        stream=_json_bool(body.get("stream", False), "stream"),
+        authorization=authorization,
     )
