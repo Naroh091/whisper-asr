@@ -303,6 +303,14 @@ async def transcriptions(
         want_words = "word" in {g.lower() for g in timestamp_granularities} or do_diar
 
         async with _gpu_lock:
+            # Diarización ANTES de transcribir (mismo lock: evita picos simultáneos
+            # de VRAM). Al ir primero, en streaming cada evento `segment` sale ya
+            # con su hablante; pyannote ve el audio completo, así que las etiquetas
+            # son globalmente consistentes desde el primer segmento.
+            turns = None
+            if do_diar:
+                turns = await asyncio.to_thread(
+                    _diarize, audio, num_speakers, min_speakers, max_speakers)
             segs_gen, info = await asyncio.to_thread(
                 lambda: _model.transcribe(
                     audio, language=lang, beam_size=BEAM_SIZE,
@@ -317,22 +325,36 @@ async def transcriptions(
                 # según avanza la decodificación. Se empuja a la cola SSE desde el
                 # hilo (call_soon_threadsafe) para que el cliente lo vea en vivo.
                 loop = asyncio.get_running_loop()
+                alpha_live: dict[str, str] = {}
+
+                def _live_item(s) -> dict:
+                    item = {"start": round(s.start, 3), "end": round(s.end, 3),
+                            "text": s.text.strip()}
+                    if turns is not None:
+                        # mismo criterio que el cuerpo final: mayoría de las
+                        # palabras del segmento (o solape del segmento entero)
+                        wspk = [_speaker_for(turns, w.start, w.end)
+                                for w in (s.words or [])]
+                        spk = (Counter(wspk).most_common(1)[0][0] if wspk
+                               else _speaker_for(turns, s.start, s.end))
+                        if fmt == "diarized_json":
+                            # misma normalización alfabética y mismo orden de
+                            # aparición que producirá el `done`
+                            if spk is not None and spk not in alpha_live:
+                                n = len(alpha_live)
+                                alpha_live[spk] = chr(ord("A") + n) if n < 26 else f"S{n}"
+                            spk = alpha_live.get(spk)
+                        item["speaker"] = spk
+                    return item
 
                 def _consume() -> list:
                     out = []
                     for s in segs_gen:
                         out.append(s)
-                        loop.call_soon_threadsafe(progress.put_nowait, {
-                            "start": round(s.start, 3), "end": round(s.end, 3),
-                            "text": s.text.strip()})
+                        loop.call_soon_threadsafe(progress.put_nowait, _live_item(s))
                     return out
 
                 segments = await asyncio.to_thread(_consume)
-            # Diarización dentro del mismo lock: evita picos simultáneos de VRAM.
-            turns = None
-            if do_diar:
-                turns = await asyncio.to_thread(
-                    _diarize, audio, num_speakers, min_speakers, max_speakers)
 
         text = "".join(s.text for s in segments).strip()
 

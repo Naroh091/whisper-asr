@@ -112,22 +112,29 @@ curl -N http://127.0.0.1:18005/v1/audio/transcriptions \
   -F "response_format=diarized_json" -F "diarization=true" \
   -F "stream=1"
 # : connected
-# : ping           (durante la descarga/decodificación)
+# : ping           (descarga/decodificación, luego diarización)
 # event: segment
-# data: {"start":0.0,"end":4.2,"text":"Hola, bienvenidos…"}
+# data: {"start":0.0,"end":4.2,"text":"Hola, bienvenidos…","speaker":"A"}
 # event: segment
-# data: {"start":4.2,"end":9.8,"text":"…"}
-# : ping           (durante la diarización)
+# data: {"start":4.2,"end":9.8,"text":"…","speaker":"B"}
 # event: done
 # data: {"task":"transcribe",...}
 ```
 
-Eventos: `segment` (parcial: `start`, `end`, `text` — sin hablante: la
-diarización necesita el audio completo y llega solo en el `done`), `done`
-(data = cuerpo final, JSON en una línea; el cliente debe quedarse con este y
-descartar los parciales) o `error` (data = `{"error":{...}}`). Ojo: en streaming
-el status HTTP ya es `200` cuando empieza el trabajo, así que un fallo de
-decodificación/transcripción **llega como evento `error`, no como código HTTP**.
+Eventos: `segment` (parcial: `start`, `end`, `text` y, con diarización activa,
+`speaker`), `done` (data = cuerpo final, JSON en una línea; el cliente debe
+quedarse con este y descartar los parciales) o `error` (data =
+`{"error":{...}}`). Ojo: en streaming el status HTTP ya es `200` cuando empieza
+el trabajo, así que un fallo de decodificación/transcripción **llega como evento
+`error`, no como código HTTP**.
+
+Con diarización, pyannote corre **antes** que Whisper (sobre el audio completo:
+etiquetas globalmente consistentes, sin renormalizar entre bloques), así que los
+primeros `segment` tardan lo que dure esa fase (latidos mientras) pero ya llevan
+su hablante: alfabético (`"A"`, `"B"`, …) con `response_format=diarized_json` —
+idéntico al mapeo del `done` — o la etiqueta pyannote (`SPEAKER_00`, …) en el
+resto de formatos, igual que en el cuerpo final. Sin diarización no hay campo
+`speaker` y los `segment` empiezan en cuanto acaba la descarga.
 
 **Importante:** todo proxy intermedio debe reenviar el stream sin bufferizar. La
 respuesta ya manda `X-Accel-Buffering: no` (nginx).
