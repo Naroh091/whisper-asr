@@ -195,9 +195,10 @@ async def _sse_stream(work, progress: asyncio.Queue | None = None):
     """Envuelve el cómputo (`work`, un coroutine que devuelve un Response) en un
     stream SSE con latidos. Emite `: ping` cada SSE_HEARTBEAT segundos mientras la
     transcripción corre en background, para que Cloudflare no dispare el 524; si
-    `work` empuja segmentos parciales a `progress`, cada uno sale como evento
-    `segment` en cuanto Whisper lo produce; al terminar, un evento `done` con el
-    cuerpo completo de la respuesta (o `error` si falla).
+    `work` empuja pares (evento, datos) a `progress` — `phase` al cambiar de fase,
+    `segment` por cada segmento transcrito — salen en cuanto se producen; al
+    terminar, un evento `done` con el cuerpo completo de la respuesta (o `error`
+    si falla).
 
     Nota: en streaming el status HTTP ya es 200 cuando empieza el trabajo, así que
     los fallos NO pueden viajar como código HTTP; van como evento `error`."""
@@ -213,18 +214,18 @@ async def _sse_stream(work, progress: asyncio.Queue | None = None):
             done, _ = await asyncio.wait(waiters, timeout=SSE_HEARTBEAT,
                                          return_when=asyncio.FIRST_COMPLETED)
             if getter is not None and getter in done:
-                seg = getter.result()
+                ev, data = getter.result()
                 getter = None
-                yield _sse_event("segment", json.dumps(seg, ensure_ascii=False))
+                yield _sse_event(ev, json.dumps(data, ensure_ascii=False))
                 continue  # sigue drenando la cola antes de mirar el task
             if task in done:
                 break
             yield b": ping\n\n"
-        # segmentos que quedaran encolados cuando terminó el trabajo
+        # eventos que quedaran encolados cuando terminó el trabajo
         if progress is not None:
             while not progress.empty():
-                yield _sse_event("segment",
-                                 json.dumps(progress.get_nowait(), ensure_ascii=False))
+                ev, data = progress.get_nowait()
+                yield _sse_event(ev, json.dumps(data, ensure_ascii=False))
         resp = task.result()  # relanza la excepción de _work si la hubo
         body = bytes(resp.body)
         log.info("sse: emitiendo done (%d bytes)", len(body))
@@ -289,7 +290,10 @@ async def transcriptions(
         """Todo el cómputo (decode + Whisper + diarización + formato). Devuelve el
         Response final. Se ejecuta directo en modo normal, o envuelto en SSE cuando
         stream=1 (mismo cuerpo, para no duplicar la lógica de formatos). Si recibe
-        `progress`, empuja cada segmento transcrito según Whisper lo produce."""
+        `progress`, empuja marcadores de fase y cada segmento transcrito según
+        Whisper lo produce."""
+        if progress is not None:
+            progress.put_nowait(("phase", {"phase": "downloading"}))
         if file is not None:
             audio = _decode_to_pcm(await file.read())
         elif file_url:
@@ -302,6 +306,8 @@ async def transcriptions(
         # (los necesitamos para asignar hablante palabra a palabra).
         want_words = "word" in {g.lower() for g in timestamp_granularities} or do_diar
 
+        # duración del audio ya decodificado, para dar contexto en los `phase`
+        dur = round(len(audio) / 16000, 3)
         async with _gpu_lock:
             # Diarización ANTES de transcribir (mismo lock: evita picos simultáneos
             # de VRAM). Al ir primero, en streaming cada evento `segment` sale ya
@@ -309,8 +315,16 @@ async def transcriptions(
             # son globalmente consistentes desde el primer segmento.
             turns = None
             if do_diar:
+                if progress is not None:
+                    progress.put_nowait(("phase", {"phase": "diarizing",
+                                                   "duration": dur}))
                 turns = await asyncio.to_thread(
                     _diarize, audio, num_speakers, min_speakers, max_speakers)
+            if progress is not None:
+                # cubre también el VAD+detección de idioma, que corren al inicio
+                # de transcribe() antes del primer segmento
+                progress.put_nowait(("phase", {"phase": "transcribing",
+                                               "duration": dur}))
             segs_gen, info = await asyncio.to_thread(
                 lambda: _model.transcribe(
                     audio, language=lang, beam_size=BEAM_SIZE,
@@ -351,7 +365,8 @@ async def transcriptions(
                     out = []
                     for s in segs_gen:
                         out.append(s)
-                        loop.call_soon_threadsafe(progress.put_nowait, _live_item(s))
+                        loop.call_soon_threadsafe(progress.put_nowait,
+                                                  ("segment", _live_item(s)))
                     return out
 
                 segments = await asyncio.to_thread(_consume)
