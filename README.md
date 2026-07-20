@@ -112,7 +112,14 @@ curl -N http://127.0.0.1:18005/v1/audio/transcriptions \
   -F "response_format=diarized_json" -F "diarization=true" \
   -F "stream=1"
 # : connected
-# : ping           (descarga/decodificación, luego diarización)
+# event: phase
+# data: {"phase":"downloading"}
+# : ping           (mientras dura la descarga/decodificación)
+# event: phase
+# data: {"phase":"diarizing","duration":10414.1}
+# : ping           (mientras dura la diarización)
+# event: phase
+# data: {"phase":"transcribing","duration":10414.1}
 # event: segment
 # data: {"start":0.0,"end":4.2,"text":"Hola, bienvenidos…","speaker":"A"}
 # event: segment
@@ -121,9 +128,12 @@ curl -N http://127.0.0.1:18005/v1/audio/transcriptions \
 # data: {"task":"transcribe",...}
 ```
 
-Eventos: `segment` (parcial: `start`, `end`, `text` y, con diarización activa,
-`speaker`), `done` (data = cuerpo final, JSON en una línea; el cliente debe
-quedarse con este y descartar los parciales) o `error` (data =
+Eventos: `phase` (cambio de fase: `downloading` → `diarizing` si procede →
+`transcribing`; desde la segunda incluye `duration`, los segundos de audio ya
+decodificados — útil para una barra de progreso contra el `end` de los
+`segment`), `segment` (parcial: `start`, `end`, `text` y, con diarización
+activa, `speaker`), `done` (data = cuerpo final, JSON en una línea; el cliente
+debe quedarse con este y descartar los parciales) o `error` (data =
 `{"error":{...}}`). Ojo: en streaming el status HTTP ya es `200` cuando empieza
 el trabajo, así que un fallo de decodificación/transcripción **llega como evento
 `error`, no como código HTTP**.
