@@ -305,6 +305,11 @@ async def transcriptions(
         # word timestamps si el cliente lo pide, o siempre que haya diarización
         # (los necesitamos para asignar hablante palabra a palabra).
         want_words = "word" in {g.lower() for g in timestamp_granularities} or do_diar
+        # Escalera de temperaturas anti-bucle: greedy y, si la ventana sale
+        # degenerada (compression_ratio_threshold la detecta), reintento con más
+        # temperatura. Un escalar desactivaría ese fallback y Whisper se queda
+        # atascado repitiendo la misma frase en audios largos.
+        temps = [temperature] + [t for t in (0.2, 0.4, 0.6, 0.8, 1.0) if t > temperature]
 
         # duración del audio ya decodificado, para dar contexto en los `phase`
         dur = round(len(audio) / 16000, 3)
@@ -328,8 +333,14 @@ async def transcriptions(
             segs_gen, info = await asyncio.to_thread(
                 lambda: _model.transcribe(
                     audio, language=lang, beam_size=BEAM_SIZE,
-                    temperature=temperature, initial_prompt=prompt,
+                    temperature=temps, initial_prompt=prompt,
                     vad_filter=True, word_timestamps=want_words,
+                    # Anti-alucinación en audios largos: sin condicionar en el
+                    # texto previo, una repetición no se retroalimenta ventana a
+                    # ventana; y los segmentos inventados dentro de silencios
+                    # largos se descartan (solo actúa con word_timestamps).
+                    condition_on_previous_text=False,
+                    hallucination_silence_threshold=2.0 if want_words else None,
                 )
             )
             if progress is None:
