@@ -17,8 +17,18 @@ COPY requirements.txt .
 RUN "$ASR_VENV/bin/pip" install --no-cache-dir --upgrade pip \
     && "$ASR_VENV/bin/pip" install --no-cache-dir -r requirements.txt
 
-COPY server.py run-asr.sh ./
-RUN chmod +x run-asr.sh
+# El servicio de streaming usa un entorno separado por la compatibilidad de diart
+# con PyTorch/pyannote. El índice CPU evita instalar otra copia de CUDA.
+RUN python -m venv /opt/diart-venv
+COPY streaming/requirements.txt /tmp/streaming-requirements.txt
+RUN /opt/diart-venv/bin/pip install --no-cache-dir --upgrade pip \
+    && /opt/diart-venv/bin/pip install --no-cache-dir \
+       torch==2.2.2 torchaudio==2.2.2 torchvision==0.17.2 \
+       --index-url https://download.pytorch.org/whl/cpu \
+    && /opt/diart-venv/bin/pip install --no-cache-dir -r /tmp/streaming-requirements.txt
+
+COPY server.py run-asr.sh streaming/ /app/streaming/
+RUN chmod +x /app/run-asr.sh /app/streaming/run-stream.sh
 
 ENV ASR_HOST=0.0.0.0 \
     ASR_PORT=18005 \
@@ -27,7 +37,7 @@ ENV ASR_HOST=0.0.0.0 \
     WHISPER_DEVICE=cuda \
     WHISPER_COMPUTE=float16
 
-EXPOSE 18005
+EXPOSE 18005 18006
 
 # El modelo se descarga en el primer arranque a HF_HOME; monta un volumen ahí
 # (ej. -v whisper-cache:/root/.cache/huggingface) para no rebajarlo cada vez.
