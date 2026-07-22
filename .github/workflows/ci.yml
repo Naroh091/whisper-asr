@@ -76,5 +76,5 @@ jobs:
           context: .
           push: true
           tags: |
-            ghcr.io/${{ github.repository_owner }}/whisper-asr:latest
-            ghcr.io/${{ github.repository_owner }}/whisper-asr:${{ github.sha }}
+            ghcr.io/naroh091/whisper-asr:latest
+            ghcr.io/naroh091/whisper-asr:${{ github.sha }}
