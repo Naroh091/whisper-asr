@@ -5,7 +5,7 @@ FROM python:3.12-slim
 
 # ffmpeg para decodificar cualquier contenedor de audio/vídeo
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg \
+    && apt-get install -y --no-install-recommends ffmpeg libportaudio2 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
