@@ -27,7 +27,8 @@ RUN /opt/diart-venv/bin/pip install --no-cache-dir --upgrade pip \
        --index-url https://download.pytorch.org/whl/cpu \
     && /opt/diart-venv/bin/pip install --no-cache-dir -r /tmp/streaming-requirements.txt
 
-COPY server.py run-asr.sh streaming/ /app/streaming/
+COPY server.py run-asr.sh /app/
+COPY streaming/ /app/streaming/
 RUN chmod +x /app/run-asr.sh /app/streaming/run-stream.sh
 
 ENV ASR_HOST=0.0.0.0 \
