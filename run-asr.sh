@@ -24,6 +24,10 @@ export WHISPER_CPU_THREADS="${WHISPER_CPU_THREADS:-16}"
 export HF_HOME="${HF_HOME:-/workspace/.hf_home}"
 export ASR_HOST="${ASR_HOST:-127.0.0.1}"
 export ASR_PORT="${ASR_PORT:-18005}"
+export ASR_RT_HOST="${ASR_RT_HOST:-0.0.0.0}"
+export ASR_RT_PORT="${ASR_RT_PORT:-18006}"
+export ASR_STREAM_VENV="${ASR_STREAM_VENV:-/opt/diart-venv}"
+export ASR_BACKEND_URL="${ASR_BACKEND_URL:-http://127.0.0.1:${ASR_PORT}/v1/audio/transcriptions}"
 
 # API key opcional: si existe el fichero (fuera del repo), se exige Bearer.
 # LiteLLM reenvía su `api_key` como Authorization: Bearer en /audio/transcriptions.
@@ -40,7 +44,17 @@ if [ -z "${HF_TOKEN:-}" ] && [ -f "$HF_TOKEN_FILE" ]; then
 fi
 export ASR_ENABLE_DIARIZATION="${ASR_ENABLE_DIARIZATION:-1}"
 
-exec "$VENV/bin/uvicorn" server:app \
+# Arranca ambos servicios en el mismo contenedor: batch (:18005) y streaming (:18006).
+"$VENV/bin/uvicorn" server:app \
     --app-dir "$SCRIPT_DIR" \
     --host "$ASR_HOST" --port "$ASR_PORT" \
-    --workers 1 --timeout-keep-alive 75
+    --workers 1 --timeout-keep-alive 75 &
+BATCH_PID=$!
+"$ASR_STREAM_VENV/bin/uvicorn" streaming.stream_server:app \
+    --app-dir "$SCRIPT_DIR" \
+    --host "$ASR_RT_HOST" --port "$ASR_RT_PORT" \
+    --workers 1 --timeout-keep-alive 75 &
+STREAM_PID=$!
+trap 'kill "$BATCH_PID" "$STREAM_PID" 2>/dev/null || true' TERM INT EXIT
+wait -n "$BATCH_PID" "$STREAM_PID"
+exit $?
